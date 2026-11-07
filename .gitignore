@@ -1,0 +1,10 @@
+# 원본 데이터는 GitHub에 올리지 않음
+data/
+*.xls
+*.xlsx
+
+# EDA 표 (선택 저장)
+results/eda/
+
+__pycache__/
+.ipynb_checkpoints/
