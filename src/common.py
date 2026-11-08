@@ -34,6 +34,10 @@ from config import (
     LOWER_QUANTILE,
     UPPER_QUANTILE,
     FEATURES_16,
+    FEATURE_SELECTION,
+    N_FEATURES,
+    SELECTION_EXCLUDE,
+    TTEST_ALPHA,
 )
 
 
@@ -1272,7 +1276,7 @@ def prepare_features(data):
 # 전처리 실행 (기존 '기존 전처리' 셀의 6~10단계)
 # ============================================================
 
-def preprocess(df):
+def preprocess(df, seed=SEED):
     # ============================================================
     # 6. 타깃과 행 정리
     # ============================================================
@@ -1382,14 +1386,14 @@ def preprocess(df):
         all_indices,
         test_size=0.40,
         stratify=y,
-        random_state=SEED,
+        random_state=seed,
     )
 
     valid_idx, test_idx = train_test_split(
         remaining_idx,
         test_size=0.50,
         stratify=y.iloc[remaining_idx],
-        random_state=SEED,
+        random_state=seed,
     )
 
     X_train = X.iloc[train_idx].copy()
@@ -1698,7 +1702,7 @@ def build_df16(prep):
 # df16 분할 (기존 '데이터 분할' 셀)
 # ============================================================
 
-def split16(df16, prep):
+def split16(df16, prep, seed=SEED):
     X = prep.X
     train_idx, valid_idx, test_idx = prep.train_idx, prep.valid_idx, prep.test_idx
 
@@ -1723,12 +1727,12 @@ def split16(df16, prep):
     indices = np.arange(len(X16))
 
     train_idx, temp_idx = train_test_split(
-        indices, test_size=0.40, random_state=SEED,
+        indices, test_size=0.40, random_state=seed,
         shuffle=True, stratify=y16,
     )
 
     valid_idx, test_idx = train_test_split(
-        temp_idx, test_size=0.50, random_state=SEED,
+        temp_idx, test_size=0.50, random_state=seed,
         shuffle=True, stratify=y16.iloc[temp_idx],
     )
 
@@ -1796,3 +1800,267 @@ def split16(df16, prep):
         industry_distribution=industry_distribution,
         year_distribution=year_distribution,
     )
+
+
+# ============================================================
+# 변수 후보 (전처리 결과 148개 열 + 업력)
+# ============================================================
+
+def _pool_name(column):
+    """전처리 열 이름을 읽기 쉬운 이름으로 (값 열은 원래 변수명)"""
+
+    for prefix in ("numeric__values__", "numeric__missing__", "categorical__"):
+        if column.startswith(prefix):
+            return column[len(prefix):]
+
+    return column
+
+
+def build_pool(prep):
+    """
+    전체 행(원래 순서)의 변수 후보 표.
+    - 전처리 결과 148개 열 (수치 값, 결측 표시, 범주 원핫) — 훈련셋에서만 fit 된 값
+    - 업력 — build_df16 과 같은 방식으로 훈련셋에서만 fit
+    """
+
+    d16 = build_df16(prep)
+
+    processed = pd.concat([
+        prep.X_train_processed,
+        prep.X_valid_processed,
+        prep.X_test_processed,
+    ]).sort_index()
+
+    processed.columns = [_pool_name(col) for col in processed.columns]
+
+    if processed.columns.duplicated().any():
+        raise ValueError("변수 후보 이름이 중복됩니다.")
+
+    pool = processed.copy()
+    pool["업력"] = d16.df16.loc[pool.index, "업력"].to_numpy()
+
+    # fixed16 이 기존 df16 과 같은 값인지 확인
+    assert np.allclose(
+        pool[FEATURES_16].to_numpy(),
+        d16.df16.loc[pool.index, FEATURES_16].to_numpy(),
+    ), "변수 후보의 16개 열이 기존 df16 과 다릅니다."
+
+    return pool, d16
+
+
+# ============================================================
+# 변수 선택 (훈련셋에서만)
+#
+# 반환: 순위 순서의 변수 목록 (상위 k개), 전체 순위 표
+# ============================================================
+
+def _rank_by(scores, columns, tiebreak=None):
+    table = pd.DataFrame({"변수": columns, "점수": np.asarray(scores, dtype=float)})
+
+    if tiebreak is not None:
+        table["보조"] = np.asarray(tiebreak, dtype=float)
+        table = table.sort_values(["점수", "보조"], ascending=False)
+    else:
+        table = table.sort_values("점수", ascending=False)
+
+    return table.reset_index(drop=True)
+
+
+def select_features(
+    method, X_train, y_train, k=N_FEATURES, seed=SEED, exclude=SELECTION_EXCLUDE,
+):
+    from scipy.stats import ttest_ind
+    from sklearn.feature_selection import f_classif, mutual_info_classif
+    from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.preprocessing import StandardScaler
+
+    y = np.asarray(y_train).reshape(-1)
+
+    candidates = [col for col in X_train.columns if col not in set(exclude)]
+
+    if method == "fixed16":
+        chosen = [col for col in FEATURES_16 if col not in set(exclude)][:k]
+        return chosen, pd.DataFrame({"변수": chosen, "점수": np.nan})
+
+    # 훈련셋에서 상수인 열은 후보에서 뺀다
+    X = X_train[candidates]
+    X = X.loc[:, X.nunique() > 1]
+    columns = list(X.columns)
+    values = X.to_numpy(dtype=np.float64)
+
+    if len(columns) < k:
+        raise ValueError(f"후보 변수가 {len(columns)}개라 {k}개를 고를 수 없습니다.")
+
+    # 동점 처리용 단변량 F-통계량
+    f_score = np.nan_to_num(f_classif(values, y)[0])
+
+    standardized = StandardScaler().fit_transform(values)
+
+    if method == "ttest_logit":
+        # 1) Welch t-test 로 두 집단 평균 차이가 유의한 변수
+        p_values = ttest_ind(values[y == 1], values[y == 0], equal_var=False).pvalue
+        p_values = np.nan_to_num(p_values, nan=1.0)
+
+        passed = np.flatnonzero(p_values < TTEST_ALPHA)
+
+        if len(passed) < k:
+            # 유의한 변수가 k개보다 적으면 p값 순으로 채운다
+            passed = np.argsort(p_values)[:k]
+
+        # 2) 통과한 변수로 로지스틱 회귀 → 표준화 계수 크기 순
+        logistic = LogisticRegression(max_iter=5000, random_state=seed)
+        logistic.fit(standardized[:, passed], y)
+
+        scores = np.zeros(len(columns))
+        scores[passed] = np.abs(logistic.coef_[0]) + 1.0   # 통과 변수를 항상 앞에
+
+        ranking = _rank_by(scores, columns, tiebreak=-p_values)
+        ranking["p값"] = pd.Series(p_values, index=columns).loc[ranking["변수"]].to_numpy()
+
+    elif method == "elasticnet":
+        model = LogisticRegressionCV(
+            Cs=10,
+            cv=StratifiedKFold(5, shuffle=True, random_state=seed),
+            penalty="elasticnet",
+            solver="saga",
+            l1_ratios=[0.5],
+            scoring="roc_auc",
+            max_iter=5000,
+            random_state=seed,
+            n_jobs=-1,
+        ).fit(standardized, y)
+
+        ranking = _rank_by(np.abs(model.coef_[0]), columns, tiebreak=f_score)
+
+    elif method == "mutual_info":
+        scores = mutual_info_classif(values, y, random_state=seed)
+        ranking = _rank_by(scores, columns, tiebreak=f_score)
+
+    elif method == "mrmr":
+        # 관련성: F-통계량, 중복성: 이미 고른 변수와의 평균 |피어슨 상관|
+        corr = np.nan_to_num(np.abs(np.corrcoef(standardized, rowvar=False)))
+
+        selected = [int(np.argmax(f_score))]
+        order_scores = [f_score[selected[0]]]
+        remaining = set(range(len(columns))) - set(selected)
+
+        while len(selected) < k:
+            rest = np.array(sorted(remaining))
+            redundancy = corr[np.ix_(rest, selected)].mean(axis=1)
+            score = f_score[rest] / np.maximum(redundancy, 1e-6)
+
+            best = int(rest[np.argmax(score)])
+            selected.append(best)
+            order_scores.append(float(score.max()))
+            remaining.discard(best)
+
+        ranking = pd.DataFrame({
+            "변수": [columns[i] for i in selected],
+            "점수": order_scores,
+        })
+
+    elif method == "xgb":
+        from xgboost import XGBClassifier
+
+        model = XGBClassifier(
+            n_estimators=300,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            importance_type="gain",
+            random_state=seed,
+            n_jobs=-1,
+        ).fit(values, y)
+
+        ranking = _rank_by(model.feature_importances_, columns, tiebreak=f_score)
+
+    else:
+        raise ValueError(
+            f"알 수 없는 변수 선택 방법: {method}. "
+            "사용 가능: fixed16, ttest_logit, elasticnet, mutual_info, mrmr, xgb"
+        )
+
+    return list(ranking["변수"].iloc[:k]), ranking
+
+
+def selection_stability(selected_by_seed):
+    """seed별 선택 결과의 평균 쌍별 Jaccard 지수 (1 = 매번 같은 변수)"""
+
+    sets = [set(v) for v in selected_by_seed.values()]
+
+    if len(sets) < 2:
+        return np.nan
+
+    scores = [
+        len(a & b) / len(a | b)
+        for i, a in enumerate(sets)
+        for b in sets[i + 1:]
+    ]
+
+    return float(np.mean(scores))
+
+
+# ============================================================
+# seed 하나에 대한 데이터 준비 (여러 seed 반복 실험용)
+#
+# seed 마다 다시 하는 것:
+#   train/valid/test 분할 → 전처리 fit → 변수 후보 → 변수 선택 (모두 훈련셋에서만)
+# ============================================================
+
+def prepare_split(df, seed=SEED, selection=FEATURE_SELECTION, k=N_FEATURES, verbose=False):
+    """preprocess → build_pool → select_features 를 seed 하나로 실행"""
+
+    import contextlib
+    import io
+
+    # 전처리 로그는 숨긴다 (verbose=True 이면 출력)
+    sink = contextlib.nullcontext() if verbose else contextlib.redirect_stdout(io.StringIO())
+
+    with sink:
+        prep = preprocess(df, seed=seed)
+        pool, d16 = build_pool(prep)
+
+    index = (prep.train_idx, prep.valid_idx, prep.test_idx)
+    Y = (prep.y_train, prep.y_valid, prep.y_test)
+
+    selected, ranking = select_features(
+        selection, pool.loc[index[0]], Y[0], k=k, seed=seed,
+    )
+
+    X = tuple(pool.loc[idx, selected] for idx in index)
+
+    for part, target in zip(X, Y):
+        assert part.index.equals(target.index), "X 와 y 의 행 순서가 다릅니다."
+
+    print(
+        f"[seed={seed}, 변수 선택={selection}] "
+        f"train/valid/test = {len(Y[0])}/{len(Y[1])}/{len(Y[2])}, "
+        f"원본코드2 비율 = {Y[0].mean():.3f}/{Y[1].mean():.3f}/{Y[2].mean():.3f}"
+    )
+
+    if verbose:
+        print("선택된 변수 (순위 순):", selected)
+
+    return SimpleNamespace(
+        seed=seed,
+        selection=selection,
+        selected=selected,
+        ranking=ranking,
+        X=X,
+        Y=Y,
+        prep=prep,
+        pool=pool,
+        df16=d16.df16,
+    )
+
+
+def iterate_splits(df, selections, seeds, k=N_FEATURES, verbose=False):
+    """(변수 선택 방법 × seed) 마다 prepare_split 결과를 차례로 돌려준다."""
+
+    for selection in selections:
+        for seed in seeds:
+            yield prepare_split(df, seed=seed, selection=selection, k=k, verbose=verbose)
